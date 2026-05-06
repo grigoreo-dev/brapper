@@ -1,0 +1,39 @@
+# brapper
+
+> Node.js framework for building MCP/HTTP API wrappers around browser-based web applications using Puppeteer and Hono.
+
+brapper lets you attach to a real Chrome instance (via CDP) and expose a web app's functionality as a clean HTTP REST API and/or MCP server — without reverse-engineering or reimplementing anything. The browser does the work; brapper orchestrates it.
+
+A project built with brapper is called a **brap**. Each brap targets one specific web application and ships two artifacts: an HTTP API server (deployable via Docker) and an optional MCP stdio binary (installable via npx for use in Cursor/Claude Desktop).
+
+Key concepts:
+- **App class** (`MyApp`) — encapsulates all target-specific logic: navigation, auth, scraping methods
+- **BrowserSession** — manages a pool of browser tabs with configurable concurrency, queue, and auto-reconnect
+- **SessionGate** — global pause barrier for warm-up and runtime recovery (captcha, re-login)
+- **SessionMonitor** — watchdog that detects problems (captcha, auth expiry) and drives recovery via pluggable `RecoveryStrategy`
+- **HttpClient** — typed fetch wrapper for consuming brap HTTP APIs from other services
+- **Hono RPC** (`hc<AppType>`) — typed client auto-derived from server route definitions, no codegen
+
+## Docs
+
+- [README](https://raw.githubusercontent.com/grigoreo-dev/brapper/main/README.md): Overview, architecture diagram, App class pattern, Hono RPC typed client, binary files approach, full module table
+- [Creating a brap](https://raw.githubusercontent.com/grigoreo-dev/brapper/main/docs/creating-a-brap.md): Step-by-step guide — init, env schema, App class, HTTP routes, server entry, MCP stdio entry, typed client, Dockerfile, Cursor config
+- [Architecture](https://raw.githubusercontent.com/grigoreo-dev/brapper/main/docs/architecture.md): Layer diagram, BrowserSession flow, dual entry points, binary file data flow, HttpClient/Hono RPC topology, brapper vs brap responsibility table
+- [Concurrency model](https://raw.githubusercontent.com/grigoreo-dev/brapper/main/docs/concurrency.md): Page pool, FIFO queue, App lifecycle, per-request vs persistent pool patterns
+- [SessionGate and SessionMonitor](https://raw.githubusercontent.com/grigoreo-dev/brapper/main/docs/session-gate-and-monitor.md): Global pause mechanism, RecoveryStrategy interface, session states, captcha recovery examples
+
+## API
+
+- [src/types.ts](https://raw.githubusercontent.com/grigoreo-dev/brapper/main/src/types.ts): `BaseEnv`, `AppContext`, `BrapOptions` — core TypeScript interfaces
+- [src/createBrap.ts](https://raw.githubusercontent.com/grigoreo-dev/brapper/main/src/createBrap.ts): `createBrap()` — top-level orchestrator; wires session, warm-up, Hono app, MCP handler
+- [src/browser/BrowserSession.ts](https://raw.githubusercontent.com/grigoreo-dev/brapper/main/src/browser/BrowserSession.ts): `BrowserSession` — CDP connect, page pool, reconnect with backoff
+- [src/browser/PageWorker.ts](https://raw.githubusercontent.com/grigoreo-dev/brapper/main/src/browser/PageWorker.ts): `PageWorker` — `browserFetch`, `waitForResponse`, `onResponse`, `injectScript`, `evaluateExpression`
+- [src/http/createApp.ts](https://raw.githubusercontent.com/grigoreo-dev/brapper/main/src/http/createApp.ts): `createApp()` — base Hono app with CORS, timing, bearer auth, `/health`, error shape
+- [src/mcp/createMcpServer.ts](https://raw.githubusercontent.com/grigoreo-dev/brapper/main/src/mcp/createMcpServer.ts): `createMcpHandler()` — WebStandard MCP HTTP transport factory
+- [src/config/parseEnv.ts](https://raw.githubusercontent.com/grigoreo-dev/brapper/main/src/config/parseEnv.ts): `parseEnv()`, `baseEnvSchema`, `resolveBrowserWsEndpoint()`
+- [src/logging/createLogger.ts](https://raw.githubusercontent.com/grigoreo-dev/brapper/main/src/logging/createLogger.ts): `createLogger()` — pino with pino-pretty in dev
+
+## Optional
+
+- [ROADMAP](https://raw.githubusercontent.com/grigoreo-dev/brapper/main/ROADMAP.md): Planned features across v0.2–v1.0 (SessionGate, SessionMonitor, HttpClient, createStdioApp, Dockerfile templates, create-brap CLI)
+- [CONTRIBUTING](https://raw.githubusercontent.com/grigoreo-dev/brapper/main/CONTRIBUTING.md): Setup, what belongs in brapper vs brap, code style, commit conventions

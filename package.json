@@ -1,0 +1,55 @@
+{
+  "name": "brapper",
+  "version": "0.1.0",
+  "description": "Framework for building MCP/API wrappers around browser-based web applications",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "deploy"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check src",
+    "lint:fix": "biome check --write src",
+    "format": "biome format --write src"
+  },
+  "keywords": [
+    "browser",
+    "puppeteer",
+    "mcp",
+    "hono",
+    "automation",
+    "wrapper"
+  ],
+  "license": "MIT",
+  "packageManager": "pnpm@10.25.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.14",
+    "@types/node": "^25.6.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.0.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "dotenv": "^17.4.2",
+    "hono": "^4.12.17",
+    "pino": "^10.3.1",
+    "pino-pretty": "^13.1.3",
+    "puppeteer-core": "^24.42.0",
+    "zod": "^4.4.3"
+  }
+}
