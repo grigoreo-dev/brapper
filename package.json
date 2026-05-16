@@ -32,6 +32,13 @@
     "wrapper"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/grigoreo-dev/brapper.git"
+  },
+  "publishConfig": {
+    "provenance": true
+  },
   "packageManager": "pnpm@10.25.0",
   "engines": {
     "node": ">=20"
