@@ -1,198 +1,195 @@
-# SessionGate and SessionMonitor
+# SessionGate, SessionMonitor, and PageGuards
 
-Two complementary mechanisms that keep the browser session healthy and protect request processing from broken states.
+Three complementary mechanisms that keep the browser session healthy and protect request processing from broken states.
 
 ---
 
 ## SessionGate — global pause
 
-A promise-based barrier. All `withApp` calls pass through it before touching the browser. When the gate is closed, requests queue up and wait. When it opens, they all proceed.
+A promise-based barrier. All lane operations (`withPersistentPage`, `withSpawnedPage`) pass through `gate.wait()` before touching the browser. When the gate is closed, new callers suspend. When it opens, they all resume simultaneously.
 
 ```
-gate.close()  →  incoming withApp calls suspend (await gate.wait())
-gate.open()   →  all suspended calls resume simultaneously
+gate.close()  →  new lane calls suspend (await gate.wait())
+gate.open()   →  all suspended callers resume simultaneously
+gate.degrade() → all waiters receive an error (503-equivalent)
 ```
 
 ### State machine
 
 ```
-CLOSED ──(open)──▶ OPEN ──(close)──▶ CLOSED
+OPEN ──(close)──▶ CLOSED ──(openGate)──▶ OPEN
+                       └──(degrade)──▶ DEGRADED
 ```
 
-Closing an already-closed gate is a no-op — the existing waiters just keep waiting.
+Closing an already-closed gate is a no-op — existing waiters keep waiting.
 
-### Lifecycle
+### Session states
 
-| Event | Gate state | Effect |
-|-------|------------|--------|
-| Server starting, warmUp not done | closed | requests queue up |
-| warmUp completes | open | queue drains |
-| SessionMonitor detects a problem | closed | new requests queue up |
-| Recovery succeeds | open | queue drains |
-| Recovery fails / timeout | degraded | queued requests get 503 |
-
-### In withApp
-
-```typescript
-// BrowserSession.withApp (internal flow)
-async withApp<T>(AppClass, handler) {
-  await this.gate.wait()       // ← blocks here if gate is closed
-  const tab = await this.acquireTab()
-  const app = await AppClass.create(tab)
-  try {
-    return await handler(app)
-  } finally {
-    await tab.close()
-  }
-}
+```
+STARTING    gate open (server not yet ready, warmUp running or not called)
+READY       gate open, normal operation
+RECOVERING  gate closed, recovery in progress
+DEGRADED    recovery failed, gate permanently closed until process restart
 ```
 
-Already-running handlers are not interrupted when the gate closes — only new incoming calls are held.
+Note: the gate starts **open** (`READY`) at construction. `markStarting()` closes it and is only useful if you need to manually pause before explicit readiness. `createBrap` no longer calls `markStarting()` during warmUp — warmUp runs while the gate is open because the HTTP server hasn't started yet at that point.
+
+### /health response
+
+```json
+{ "ok": true,  "state": "ready",      "browser_connected": true,
+  "warm": true, "persistent_pages": { "total": 1, "healthy": 1, "restarting": 0 },
+  "spawned_inflight": 2, "queue_depth": 0 }
+
+{ "ok": false, "state": "recovering", "browser_connected": true, ... }
+{ "ok": false, "state": "degraded",   "browser_connected": false, ... }
+```
+
+Returns `200` when `ok: true`, `503` otherwise.
 
 ---
 
-## SessionMonitor — background watchdog
+## SessionMonitor — recovery orchestration
 
-Watches browser pages for problem conditions (captcha, auth expiry, error pages) and drives recovery. When a problem is detected it closes the gate, runs the recovery strategy, then opens the gate again.
+`SessionMonitor` drives the session state machine. It receives failure events from three sources and runs the recovery pipeline.
 
-### Recovery strategy interface
+### Failure sources
+
+| Source | How it arrives |
+|--------|---------------|
+| Browser disconnect | `BrowserSupervisor.onDisconnected` fires when the CDP connection drops |
+| Page crash / close | `page.on('close')` event on a spawned page |
+| Guard trip | `PageGuard` attached to a page signals a problem |
+
+### Recovery pipeline
+
+```
+failure event received
+        │
+        ▼
+already recovering? → yes → skip (single-flight)
+        │
+        ▼ no
+gate.close()             ← new lane calls start queueing
+        │
+        ▼
+for each RecoveryStrategy:
+    strategy.detect(page) → true?
+        │
+        ▼
+    strategy.recover(worker) → 'ok' | 'failed'
+        │
+   'ok' → gate.open() → queue drains → done
+        │
+   'failed' (or no strategy matched) → try recoverBrowser()
+        │
+   success → gate.open() → done
+        │
+   error → gate.degrade() → all waiters get error
+```
+
+If `monitor.abort()` is called (during graceful shutdown) the pipeline exits immediately and does not open or degrade the gate.
+
+### RecoveryStrategy interface
 
 ```typescript
-interface RecoveryStrategy {
-  name: string
+import type { RecoveryStrategy } from 'brapper'
+import type { Page } from 'puppeteer-core'
 
-  // Return true if this page needs recovery.
-  // Receives the full Page — can check url, DOM, cookies, anything.
-  detect(page: Page): boolean | Promise<boolean>
+export const reloginStrategy: RecoveryStrategy = {
+  name: 'relogin',
 
-  // Attempt to fix the problem.
-  // Return 'ok' if resolved, 'failed' if not.
-  recover(worker: PageWorker): Promise<'ok' | 'failed'>
+  detect: (page: Page) => page.url().includes('/login'),
+
+  recover: async (worker) => {
+    await worker.page.goto('https://app.example.com/login')
+    await worker.page.fill('#email', process.env.APP_EMAIL!)
+    await worker.page.fill('#password', process.env.APP_PASSWORD!)
+    await worker.page.click('[type=submit]')
+    await worker.page.waitForNavigation()
+    return worker.page.url().includes('/login') ? 'failed' : 'ok'
+  },
 }
 ```
 
-`page` carries everything needed — `page.url()` for URL checks, `page.evaluate()` for DOM inspection, `page.cookies()` for auth state.
-
-### Registration
-
-Strategies are registered per-brap and passed into `createServer`:
+Register in `createBrap`:
 
 ```typescript
-// src/server.ts in a brap
-await createServer({
+await createBrap({
   env,
+  recoveryStrategies: [reloginStrategy, captchaStrategy],
   routes: registerRoutes,
-  warmUp: async (session) => { ... },
-  recoveryStrategies: [
-    captchaStrategy,
-    reloginStrategy,
-  ],
 })
 ```
 
-`SessionMonitor` attaches the detectors to every page opened via `withApp`. If any page triggers a detector mid-request, the monitor takes over.
-
-### Recovery flow
-
-```
-any page triggers detect(page) → true
-          │
-          ▼
-gate.close()              ← new requests start queueing
-          │
-          ▼
-strategy.recover(worker)
-          │
-     ┌────┴────┐
-    'ok'    'failed'
-     │          │
-     ▼          ▼
-gate.open()  gate.degrade()
-(queue       (queue gets
- drains)      503 responses)
-```
-
-If multiple pages hit the same condition simultaneously, the monitor ensures only one recovery runs at a time — subsequent detections while recovery is in progress are ignored.
-
 ---
 
-## Session states
+## PageGuards — per-page condition detectors
 
-```
-STARTING    warmUp not yet complete, gate closed
-READY       gate open, normal operation
-RECOVERING  gate closed, recovery in progress
-DEGRADED    recovery failed, gate permanently closed until restart
-```
+Guards are optional detectors attached to individual pages (persistent or spawned). When a guard trips, it signals `SessionMonitor` which runs the recovery pipeline.
 
-`GET /health` exposes current state:
-
-```json
-{ "ok": true,  "state": "ready",      "browser_connected": true }
-{ "ok": false, "state": "recovering", "browser_connected": true }
-{ "ok": false, "state": "degraded",   "browser_connected": true }
-```
-
----
-
-## Example: captcha strategy in a brap
+### Guard interface
 
 ```typescript
-// src/monitor/captchaStrategy.ts
-import type { RecoveryStrategy } from 'brapper'
+import type { PageGuard, GuardSignal } from 'brapper'
 
-export const captchaStrategy: RecoveryStrategy = {
-  name: 'captcha',
+export const authGuard: PageGuard = {
+  name: 'auth',
+  severity: 'recoverable',   // 'warn' | 'recoverable' | 'fatal'
 
-  detect: (page) => page.url().includes('/showcaptcha'),
-
-  recover: async (worker) => {
-    const siteKey = await worker.evaluateExpression<string>(
-      'window.__SSR_DATA__?.captcha?.siteKey ?? ""'
+  // Called once when the page is created, returns cleanup fn
+  attach(worker, signal: GuardSignal) {
+    const unsubscribe = worker.onResponse(
+      (url) => url.includes('/api/'),
+      (res) => {
+        if (res.status === 401) signal.emit('401 on API response')
+      },
     )
-    if (!siteKey) return 'failed'
+    return unsubscribe
+  },
 
-    const token = await captchaSolver.solve({ siteKey, url: worker.page.url() })
-    await worker.evaluateExpression(`submitCaptchaToken(${JSON.stringify(token)})`)
-    await worker.page.waitForNavigation()
-
-    return worker.page.url().includes('/showcaptcha') ? 'failed' : 'ok'
+  // Optional: called before each lane invocation as a pre-flight check
+  check: async (worker) => {
+    const url = worker.page.url()
+    return url.includes('/login') || url.includes('/captcha')
   },
 }
 ```
 
----
+- `severity: 'warn'` — logs only, no recovery
+- `severity: 'recoverable'` — closes gate, runs recovery pipeline, reopens on success
+- `severity: 'fatal'` — closes gate, skips strategies, goes straight to browser reconnect
 
-## Manual recovery (no solver)
+### Attaching guards
 
-When no automatic recovery is possible, the strategy logs and waits for operator action:
+Default guards apply to every page in both lanes:
 
 ```typescript
-export const manualCaptchaStrategy: RecoveryStrategy = {
-  name: 'captcha-manual',
-
-  detect: (page) => page.url().includes('/captcha'),
-
-  recover: async (worker) => {
-    logger.warn({ url: worker.page.url() }, 'Captcha detected — resolve manually in the browser')
-    // Poll until the captcha page is gone (operator solves it in Chrome)
-    await waitUntil(() => !worker.page.url().includes('/captcha'), { timeout: 5 * 60_000 })
-    return 'ok'
-  },
-}
+await createBrap({
+  env,
+  defaultGuards: [authGuard],
+  routes: registerRoutes,
+})
 ```
 
-The server stays alive and responsive to `/health` while recovery is pending. Clients can poll `/health` and retry when state returns to `ready`.
+Per-call guards apply only to that specific invocation:
+
+```typescript
+// Persistent page with extra guard
+session.withPersistentPage(fn, { key: 'main', guards: [captchaGuard] })
+
+// Spawned page with extra guard
+session.withSpawnedPage(fn, { guards: [rateLimitGuard] })
+```
 
 ---
 
-## What brapper provides
+## Graceful shutdown
 
-| Class | Responsibility |
-|-------|----------------|
-| `SessionGate` | Promise-based open/close barrier; `wait()`, `open()`, `close()`, `degrade()` |
-| `SessionMonitor` | Attaches detectors to pages, runs recovery, drives gate state |
-| `SessionState` | Enum: `starting / ready / recovering / degraded` |
-| `RecoveryStrategy` | Interface for pluggable detect + recover logic |
+`session.disconnect()` performs a clean shutdown in three steps:
 
-`BrowserSession` wires `SessionGate` and `SessionMonitor` together internally. brap code only defines `RecoveryStrategy` implementations and passes them to `createServer`.
+1. `monitor.abort()` — stops any in-progress recovery immediately.
+2. `await persistentLane.invalidateAll()` — closes all persistent pages via CDP before dropping the connection.
+3. `await supervisor.disconnect()` — sets `closing = true` to silence the `'disconnected'` event, then drops the CDP connection.
+
+The `closing` flag also causes any in-progress reconnect loop to exit at its next iteration, preventing the process from staying alive past `SIGINT`/`SIGTERM`.

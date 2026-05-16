@@ -7,37 +7,23 @@ A step-by-step guide to building a new browser wrapper project with brapper.
 ## 1. Initialize the project
 
 ```bash
-mkdir @grigoreo-dev/my-brap && cd @grigoreo-dev/my-brap
+mkdir my-brap && cd my-brap
 pnpm init
 pnpm add brapper
 pnpm add -D typescript tsx @types/node
 ```
 
-`package.json` — set type, bin, and scripts:
+`package.json` — set type, scripts, and optional bin:
 
 ```json
 {
-  "name": "@grigoreo-dev/my-brap",
+  "name": "@my-org/my-brap",
   "version": "0.1.0",
   "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "exports": {
-    ".": {
-      "import": "./dist/index.js",
-      "types":  "./dist/index.d.ts"
-    }
-  },
-  "bin": {
-    "my-brap-mcp": "./dist/mcp.js"
-  },
   "scripts": {
-    "build":       "tsc",
-    "postbuild":   "chmod +x dist/mcp.js",
-    "start:server": "node dist/server.js",
-    "start:mcp":    "node dist/mcp.js",
-    "dev:server":   "tsx --import dotenv/config src/server.ts",
-    "dev:mcp":      "tsx src/mcp.ts"
+    "dev":       "node --env-file=.env --import tsx/esm --watch src/server.ts",
+    "build":     "tsc",
+    "typecheck": "tsc --noEmit"
   }
 }
 ```
@@ -49,194 +35,212 @@ pnpm add -D typescript tsx @types/node
 ```typescript
 // src/config.ts
 import { z } from 'zod'
-import { baseEnvSchema } from 'brapper'
+import { baseEnvSchema, parseEnv } from 'brapper'
 
 export const envSchema = baseEnvSchema.extend({
   MY_APP_TOKEN: z.string().optional(),
-  // add any target-specific env vars here
 })
 
-export type Env = z.infer<typeof envSchema>
+export const env = parseEnv(envSchema)
+export type Env = typeof env
 ```
 
 ---
 
 ## 3. Build the App class
 
-The App class is the adapter for your target web application. One instance = one browser tab.
+The App class is the adapter for your target web application. It is **session-bound**: it holds a `BrowserSession` reference and each method decides independently which execution lane to use.
 
 ```typescript
 // src/app/MyApp.ts
-import type { PageWorker } from 'brapper'
+import type { BrowserSession } from 'brapper'
+
+const APP_URL = 'https://target-app.com'
+const PERSISTENT_KEY = 'main'
 
 export class MyApp {
-  constructor(private worker: PageWorker) {}
+  private constructor(private readonly session: BrowserSession) {}
 
-  static async create(worker: PageWorker): Promise<MyApp> {
-    // inject any scripts, navigate, wait for login, etc.
-    await worker.page.goto('https://target-app.com')
-    // await waitForLogin(worker)
-    return new MyApp(worker)
+  static async create(session: BrowserSession): Promise<MyApp> {
+    const app = new MyApp(session)
+    // Warm up the persistent page: navigate and wait for ready state
+    await session.withPersistentPage(async (worker) => {
+      await worker.page.goto(APP_URL, { waitUntil: 'domcontentloaded' })
+      await worker.page.waitForSelector('#app-ready')
+    }, { key: PERSISTENT_KEY })
+    return app
   }
 
-  // --- public methods (your actual functionality) ---
-
-  async doSomething(params: { query: string }) {
-    return this.worker.browserFetch('/api/search?q=' + params.query)
-      .then(r => r.json<SearchResult[]>())
+  // Fast: reuses the warm persistent page — no navigation overhead
+  async search(query: string): Promise<SearchResult[]> {
+    return this.session.withPersistentPage(async (worker) => {
+      const res = await worker.browserFetch('/api/search?q=' + query, {
+        credentials: 'include',
+      })
+      return res.json<SearchResult[]>()
+    }, { key: PERSISTENT_KEY })
   }
 
-  async uploadFile(path: string) {
-    const { readFile } = await import('fs/promises')
-    const bytes = await readFile(path)
-    return this.worker.browserFetch('/api/upload', {
-      method: 'POST',
-      body: bytes,
-    }).then(r => r.json<{ fileId: string }>())
+  // Isolated: opens a fresh tab per call
+  async exportReport(id: string): Promise<string> {
+    return this.session.withSpawnedPage(async (worker) => {
+      await worker.page.goto(APP_URL + '/reports/' + id)
+      await worker.page.click('#export-btn')
+      const response = await worker.waitForResponse(
+        (url) => url.includes('/api/export'),
+      )
+      return response.text()
+    })
   }
 }
 ```
 
----
+### Key design rule
 
-## 4. Define HTTP routes
-
-```typescript
-// src/http/routes.ts
-import { Hono } from 'hono'
-import type { AppContext } from 'brapper'
-import type { Env } from '../config.js'
-import { MyApp } from '../app/MyApp.js'
-
-export function registerRoutes(app: Hono, ctx: AppContext<Env>) {
-  app.get('/v1/search', async (c) => {
-    const query = c.req.query('q') ?? ''
-    const result = await ctx.session!.withApp(MyApp, app => app.doSomething({ query }))
-    return c.json(result)
-  })
-}
-
-// Export AppType for the typed client
-const _routes = new Hono()
-  .get('/v1/search', () => new Response())
-
-export type AppType = typeof _routes
-```
+Each method owns its lane choice:
+- Use `withPersistentPage` for API calls (`browserFetch`, `evaluate`) that only need the page's session context.
+- Use `withSpawnedPage` for multi-step navigations or flows that must not share state between concurrent requests.
 
 ---
 
-## 5. HTTP server entry point
+## 4. HTTP server entry point
 
 ```typescript
 // src/server.ts
-import 'dotenv/config'
-import { createServer, parseEnv } from 'brapper'
-import { envSchema } from './config.js'
+import { createBrap } from 'brapper'
+import { env } from './config.js'
+import { MyApp } from './app/MyApp.js'
 import { registerRoutes } from './http/routes.js'
 
-const env = parseEnv(envSchema)
-const { start } = await createServer({ env, routes: registerRoutes })
+let myApp: MyApp
+
+const { start } = await createBrap({
+  env,
+  cookiesPath: env.COOKIES_PATH,     // optional: load cookies on startup
+  warmUp: async (session) => {
+    myApp = await MyApp.create(session)
+  },
+  routes(app) {
+    registerRoutes(app, myApp)
+  },
+})
+
 await start()
 ```
 
----
-
-## 6. MCP stdio entry point
-
-```typescript
-#!/usr/bin/env node
-// src/mcp.ts
-import 'dotenv/config'
-import { createStdioApp, parseEnv, HttpClient } from 'brapper'
-import { z } from 'zod'
-
-const env = parseEnv(z.object({
-  SERVER_URL: z.string().url(),
-  AUTH_TOKEN:  z.string().optional(),
-  LOG_LEVEL:  z.string().optional(),
-}))
-
-await createStdioApp({
-  name: 'my-brap',
-  version: '0.1.0',
-  tools: (server) => {
-    const client = new HttpClient({ baseUrl: env.SERVER_URL, token: env.AUTH_TOKEN })
-
-    server.tool(
-      'search',
-      { query: z.string() },
-      async ({ query }) => {
-        const results = await client.get<SearchResult[]>('/v1/search', { q: query })
-        return { content: [{ type: 'text', text: JSON.stringify(results) }] }
-      }
-    )
-
-    server.tool(
-      'upload_file',
-      { path: z.string().describe('Absolute path to the file on disk') },
-      async ({ path }) => {
-        const { readFile } = await import('fs/promises')
-        const bytes = await readFile(path)
-        const { fileId } = await client.postBinary('/v1/upload', bytes)
-        return { content: [{ type: 'text', text: fileId }] }
-      }
-    )
-  },
-}).start()
-```
+`warmUp` runs before `markReady()` is called. The gate stays open during warmUp because the HTTP server has not started yet — no requests can arrive.
 
 ---
 
-## 7. Typed client
+## 5. Define HTTP routes
+
+Routes receive the App instance directly and call its methods:
 
 ```typescript
-// src/client/MyClient.ts
-import { hc } from 'brapper'
-import type { AppType } from '../http/routes.js'
+// src/http/routes.ts
+import type { Hono } from 'brapper'
+import type { MyApp } from '../app/MyApp.js'
 
-export class MyClient {
-  private rpc: ReturnType<typeof hc<AppType>>
+export function registerRoutes(app: Hono, myApp: MyApp): void {
+  app.get('/v1/search', async (c) => {
+    const query = c.req.query('q') ?? ''
+    return c.json(await myApp.search(query))
+  })
 
-  constructor(serverUrl: string, token?: string) {
-    this.rpc = hc<AppType>(serverUrl, {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    })
-  }
-
-  async search(query: string) {
-    const res = await this.rpc['v1']['search'].$get({ query: { q: query } })
-    return res.json()
-  }
+  app.post('/v1/reports/:id/export', async (c) => {
+    const id = c.req.param('id')
+    const csv = await myApp.exportReport(id)
+    return c.text(csv)
+  })
 }
 ```
 
-Export from the package root:
+---
+
+## 6. Add recovery strategies (optional)
+
+Recovery strategies automatically handle auth expiry, captcha, or other mid-session failures.
 
 ```typescript
-// index.ts
-export { MyClient } from './src/client/MyClient.js'
-export { MyApp } from './src/app/MyApp.js'
+// src/recovery/reloginStrategy.ts
+import type { RecoveryStrategy } from 'brapper'
+
+export const reloginStrategy: RecoveryStrategy = {
+  name: 'relogin',
+  detect: (page) => page.url().includes('/login'),
+  recover: async (worker) => {
+    await worker.page.type('#email', process.env.APP_EMAIL!)
+    await worker.page.type('#password', process.env.APP_PASSWORD!)
+    await worker.page.click('[type=submit]')
+    await worker.page.waitForNavigation()
+    return worker.page.url().includes('/login') ? 'failed' : 'ok'
+  },
+}
+```
+
+Register in `createBrap`:
+
+```typescript
+await createBrap({
+  env,
+  recoveryStrategies: [reloginStrategy],
+  routes(app) { registerRoutes(app, myApp) },
+})
 ```
 
 ---
 
-## 8. Concurrency configuration
+## 7. Add page guards (optional)
 
-Control how many browser tabs run in parallel:
+Guards are per-page detectors that signal `SessionMonitor` when a condition is met.
 
 ```typescript
-// src/server.ts
-const { start } = await createServer({
+// src/guards/authGuard.ts
+import type { PageGuard } from 'brapper'
+
+export const authGuard: PageGuard = {
+  name: 'auth',
+  severity: 'recoverable',
+  attach(worker, signal) {
+    return worker.onResponse(
+      (url) => url.startsWith('https://target-app.com/api/'),
+      (res) => { if (res.status === 401) signal.emit('401 on API') },
+    )
+  },
+}
+```
+
+Pass as `defaultGuards` to apply to every page:
+
+```typescript
+await createBrap({
   env,
-  routes: registerRoutes,
-  sessionConcurrency: 3,    // up to 3 parallel tabs
+  defaultGuards: [authGuard],
+  recoveryStrategies: [reloginStrategy],
+  routes(app) { registerRoutes(app, myApp) },
 })
 ```
 
-With `concurrency: 3`:
-- First 3 requests each get their own tab immediately
-- Request 4 waits in queue until one tab finishes
-- After the handler returns, the tab is closed and the next queued job starts
+---
+
+## 8. Health check
+
+`GET /health` returns the full session state:
+
+```json
+{
+  "ok": true,
+  "state": "ready",
+  "browser_connected": true,
+  "warm": true,
+  "persistent_pages": { "total": 1, "healthy": 1, "restarting": 0 },
+  "spawned_inflight": 0,
+  "queue_depth": 0,
+  "timestamp": "2026-05-16T..."
+}
+```
+
+Returns `200` when `ok: true`, `503` during `recovering` or `degraded`.
 
 ---
 
@@ -248,41 +252,26 @@ Copy the base Dockerfile from brapper:
 cp node_modules/brapper/deploy/Dockerfile ./Dockerfile
 ```
 
-The default `CMD` runs `dist/index.js` — update it to `dist/server.js` if needed.
-
 ---
 
-## Cursor / Claude Desktop integration
+## Using the logger inside your App
 
-Add to `.cursor/mcp.json` (or Claude Desktop config):
+`BrowserSession` exposes `logger` (pino instance, or `undefined` if none was passed):
 
-```json
-{
-  "mcpServers": {
-    "my-brap": {
-      "command": "npx",
-      "args": ["-y", "@grigoreo-dev/my-brap-mcp"],
-      "env": {
-        "SERVER_URL": "https://my-brap.example.com",
-        "AUTH_TOKEN":  "your-token-here"
-      }
-    }
+```typescript
+export class MyApp {
+  private readonly logger
+
+  private constructor(private readonly session: BrowserSession) {
+    this.logger = session.logger
   }
-}
-```
 
-Or point directly to the local build during development:
-
-```json
-{
-  "mcpServers": {
-    "my-brap-dev": {
-      "command": "node",
-      "args": ["/absolute/path/to/my-brap/dist/mcp.js"],
-      "env": {
-        "SERVER_URL": "http://localhost:3000"
-      }
-    }
+  async search(query: string) {
+    return this.session.withPersistentPage(async (worker) => {
+      this.logger?.debug({ query }, 'Fetching search results')
+      const res = await worker.browserFetch('/api/search?q=' + query)
+      return res.json<SearchResult[]>()
+    }, { key: 'main' })
   }
 }
 ```

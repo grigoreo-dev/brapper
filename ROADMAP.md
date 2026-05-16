@@ -25,7 +25,7 @@ Core infrastructure. Everything needed to build a working brap.
 
 ## v0.2 — Session lifecycle
 
-Make sessions production-ready: warm-up gating, runtime recovery, clean shutdown.
+Make sessions production-ready: warm-up gating, runtime recovery, clean shutdown, and dual page execution lanes.
 
 - [ ] `SessionGate` — promise-based open/close barrier; `wait`, `open`, `close`, `degrade`
 - [ ] `SessionMonitor` — attaches `RecoveryStrategy` detectors to pages, drives gate state
@@ -33,6 +33,12 @@ Make sessions production-ready: warm-up gating, runtime recovery, clean shutdown
 - [ ] `SessionState` enum — `starting / ready / recovering / degraded`
 - [ ] `/health` reflects session state
 - [ ] Graceful shutdown — drain active `withApp` jobs before process exit
+- [ ] Persistent page lane — single long-lived page (or keyed pages) for low-latency `evaluate`/`browserFetch` calls
+- [ ] Spawned page lane — existing per-call page lifecycle, available concurrently with persistent lane
+- [ ] Unified browser-failure recovery — full browser disconnect/crash recovery works for both lanes simultaneously
+- [ ] Persistent page self-healing — auto-recreate persistent page after page close/crash without process restart
+- [ ] Page guards — optional per-page guard set on new pages to monitor auth/captcha/session integrity
+- [ ] Guard-triggered recovery orchestration — guard failures close gate, recover, and reopen/degrade
 - [x] `withApp` on `BrowserSession` — App class pattern with pool + queue *(shipped in v0.1)*
 
 ---
@@ -77,6 +83,7 @@ Production HTTP layer.
 Make brapper deployments monitorable.
 
 - [ ] Prometheus `/metrics` endpoint — active tabs, queue depth, recovery count, request latency
+- [ ] Lane-level metrics — persistent lane usage, spawned lane usage, and persistent page restart counts
 - [ ] Structured request IDs — propagate `x-request-id` through logs and MCP tool calls
 - [ ] Session event hooks — `onReady`, `onRecovering`, `onDegraded` callbacks in `createServer`
 
@@ -90,6 +97,8 @@ Make braps testable without a real browser.
 - [ ] `MockHttpClient` — response fixtures for testing stdio MCP tools
 - [ ] `createTestServer` — spin up a brapper HTTP server with a mock session for integration tests
 - [ ] Unit tests for `SessionGate`, `SessionMonitor`, `parseEnv`, `HttpClient`
+- [ ] Crash-recovery tests — validate full browser failure recovery for both persistent and spawned lanes
+- [ ] Guard tests — validate per-page guard attach/detach and recovery trigger semantics
 
 ---
 

@@ -2,6 +2,8 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Hono } from 'hono';
 import type { Logger } from 'pino';
 import type { BrowserSession } from './browser/BrowserSession.js';
+import type { PageGuard } from './session/PageGuard.js';
+import type { RecoveryStrategy } from './session/RecoveryStrategy.js';
 
 export interface BaseEnv {
   PORT: number;
@@ -25,5 +27,6 @@ export interface BrapOptions<TEnv extends BaseEnv> {
   mcpTools?: ((server: McpServer, ctx: AppContext<TEnv>) => void) | undefined;
   cookiesPath?: string;
   warmUp?: ((session: BrowserSession, env: TEnv) => Promise<void>) | undefined;
-  // sessionConcurrency — proper semaphore pool coming in v0.2; disabled for now
+  recoveryStrategies?: RecoveryStrategy[];
+  defaultGuards?: PageGuard[];
 }

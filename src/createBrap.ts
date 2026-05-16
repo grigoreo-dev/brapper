@@ -9,7 +9,7 @@ import type { AppContext, BaseEnv, BrapOptions } from './types.js';
 export async function createBrap<TEnv extends BaseEnv>(
   options: BrapOptions<TEnv>,
 ): Promise<{ start: () => Promise<void> }> {
-  const { env, routes, mcpTools, cookiesPath, warmUp } = options;
+  const { env, routes, mcpTools, cookiesPath, warmUp, recoveryStrategies, defaultGuards } = options;
 
   const logger = createLogger(env.LOG_LEVEL, env.NODE_ENV !== 'production');
 
@@ -19,7 +19,12 @@ export async function createBrap<TEnv extends BaseEnv>(
     throw new Error('No browser endpoint provided — set BROWSER_WS_ENDPOINT or BROWSER_ENDPOINT');
   }
 
-  const session = new BrowserSession({ wsEndpoint, logger });
+  const session = new BrowserSession({
+    wsEndpoint,
+    logger,
+    recoveryStrategies,
+    defaultGuards,
+  });
   await session.connect();
 
   if (cookiesPath) {
@@ -32,9 +37,9 @@ export async function createBrap<TEnv extends BaseEnv>(
   if (warmUp) {
     logger.info('Running warm-up...');
     await warmUp(session, env);
-    session.setWarm(true);
     logger.info('Warm-up complete');
   }
+  session.markReady();
 
   const app = createApp({
     logger,

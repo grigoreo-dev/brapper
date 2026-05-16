@@ -11,26 +11,38 @@
              │                                 │ (stdio)
 ┌────────────▼────────────┐   ┌───────────────▼──────────────────┐
 │     MyClient            │   │      MCP stdio binary             │
-│  (typed Hono RPC)       │   │   (npx @my-org/my-brap-mcp)               │
+│  (typed Hono RPC)       │   │   (npx @my-org/my-brap-mcp)       │
 └────────────┬────────────┘   └───────────────┬──────────────────┘
              │ HTTP                            │ HTTP
              │                                 │
 ┌────────────▼─────────────────────────────────▼──────────────────┐
 │                      HTTP API Server                             │
-│               Hono + brapper infrastructure                │
+│               Hono + brapper infrastructure                      │
 │                                                                  │
 │   GET /health    POST /v1/...    GET /openapi.json    /mcp       │
 └─────────────────────────────┬────────────────────────────────────┘
-                              │ session.withApp(MyApp, ...)
+                              │ app.authorize() / app.getPayment()
 ┌─────────────────────────────▼────────────────────────────────────┐
-│                    BrowserSession (page pool)                     │
+│                  Session-bound App (MyApp)                        │
 │                                                                  │
-│   concurrency: N        queue: unlimited        reconnect: yes   │
+│   holds BrowserSession reference                                 │
+│   each method picks its own execution lane                       │
 │                                                                  │
-│   ┌──────────┐  ┌──────────┐  ┌──────────┐                      │
-│   │  MyApp   │  │  MyApp   │  │  MyApp   │   ← one per tab      │
-│   │ (tab 1)  │  │ (tab 2)  │  │ (tab 3)  │                      │
-│   └──────────┘  └──────────┘  └──────────┘                      │
+│   method A ──▶ session.withPersistentPage(...)  ← reuses tab    │
+│   method B ──▶ session.withSpawnedPage(...)     ← fresh tab     │
+└─────────────────────────────┬────────────────────────────────────┘
+                              │
+┌─────────────────────────────▼────────────────────────────────────┐
+│                    BrowserSession                                 │
+│                                                                  │
+│  ┌──────────────────────┐   ┌──────────────────────────────────┐ │
+│  │  Persistent lane     │   │  Spawned lane                    │ │
+│  │  one tab per key,    │   │  new tab per call, closed after  │ │
+│  │  kept alive, mutex   │   │  handler returns, parallelism N  │ │
+│  └──────────────────────┘   └──────────────────────────────────┘ │
+│                                                                  │
+│  SessionGate ── SessionMonitor ── BrowserSupervisor              │
+│  (pause barrier)  (recovery)      (CDP connect/reconnect)        │
 └─────────────────────────────┬────────────────────────────────────┘
                               │ CDP / puppeteer-core
 ┌─────────────────────────────▼────────────────────────────────────┐
@@ -41,101 +53,117 @@
 
 ---
 
-## BrowserSession and the App class
+## The session-bound App pattern
 
-`BrowserSession` manages the connection to one Chrome instance and a pool of tabs. When a request arrives, `withApp` picks (or waits for) a free tab, creates an App instance on it, runs the handler, then closes the tab.
+An App class is the adapter for a specific web application. It holds a reference to the `BrowserSession` and each method decides independently whether to run on a persistent page or a fresh spawned page.
+
+```typescript
+// src/app/MyApp.ts
+import type { BrowserSession } from 'brapper'
+
+export class MyApp {
+  private constructor(private readonly session: BrowserSession) {}
+
+  static async create(session: BrowserSession): Promise<MyApp> {
+    const app = new MyApp(session)
+    // Warm up the persistent page on first use
+    await session.withPersistentPage(async (worker) => {
+      await worker.page.goto('https://target-app.com', { waitUntil: 'domcontentloaded' })
+    }, { key: 'main' })
+    return app
+  }
+
+  // Fast: reuses the warm persistent page — no navigation overhead
+  async doSomething(query: string) {
+    return this.session.withPersistentPage(async (worker) => {
+      const res = await worker.browserFetch('/api/search?q=' + query)
+      return res.json<SearchResult[]>()
+    }, { key: 'main' })
+  }
+
+  // Isolated: opens a fresh tab, closes it after handler returns
+  async scrapeIsolated(url: string) {
+    return this.session.withSpawnedPage(async (worker) => {
+      await worker.page.goto(url)
+      return worker.evaluate(() => document.title)
+    })
+  }
+}
+```
+
+### Why session-bound instead of page-bound
+
+The previous pattern (`create(worker: PageWorker)`) was page-bound: the App held a single page and all methods ran on it. This meant brapper had to pick the execution mode before creating the App.
+
+The session-bound pattern inverts control: the App holds the session and each method selects its own lane. This makes sense because:
+
+- Different methods have different requirements: `browserFetch` calls are fast and re-entrant; DOM automation may need isolation.
+- The App author knows best which operations are safe to share a page and which need isolation.
+- One App instance can use a persistent page for quick API calls and spawn fresh pages for complex flows — simultaneously.
+
+---
+
+## Execution lanes
+
+### Persistent page lane
+
+`session.withPersistentPage(fn, { key })` runs `fn` on a long-lived tab identified by `key`.
+
+- Tab is created lazily on first use, then kept alive.
+- Calls with the same `key` are serialised via a per-key mutex.
+- Calls with different keys run in parallel (each key has its own tab).
+- If the page closes or crashes, it is recreated automatically before the next call.
+- On full browser disconnect, all persistent pages are invalidated and recreated after reconnect.
+
+### Spawned page lane
+
+`session.withSpawnedPage(fn)` opens a fresh tab, runs `fn`, then closes the tab — even if `fn` throws.
+
+- Up to `concurrency` calls run in parallel (default: `1`, serial queue).
+- Each call gets a completely isolated tab with no shared state.
+- On browser disconnect, in-flight spawned calls receive an error and the tab is discarded.
+
+Both lanes pass through `SessionGate` so recovery pauses all new work uniformly.
+
+---
+
+## Request flow
 
 ```
 HTTP request arrives
         │
         ▼
-session.withApp(MyApp, async (app) => {
-    ├─ if free tab available → open new tab immediately
-    │         └─ MyApp.create(worker) → navigate, inject, warm-up
-    │
-    └─ if all tabs busy → wait in queue (FIFO)
-              └─ when tab freed → same as above
-})
+route handler calls app.someMethod()
         │
         ▼
-handler runs → app.doSomething()
+method calls session.withPersistentPage(fn, { key: 'main' })
         │
         ▼
-tab.close() → slot freed → next queued job starts
+SessionGate.wait()          ← suspends if recovering
+        │
+        ▼
+PersistentPageLane.withPage(key, fn)
+        │
+        ├── key exists and page healthy → acquire mutex → run fn
+        │
+        └── page missing or closed → recreate → acquire mutex → run fn
+        │
+        ▼
+fn runs → result returned → mutex released
 ```
-
-This means each request gets a **fresh, isolated browser context** (tab). There is no shared mutable state between concurrent requests.
 
 ---
 
-## Two entry points, one codebase
+## Session internals
 
-```
-src/
-├── server.ts    →  HTTP API + optional HTTP MCP
-│                   runs in Docker / on a server
-│                   needs: Chrome with CDP
-│
-└── mcp.ts       →  MCP stdio
-                    runs locally on the user's machine
-                    needs: SERVER_URL pointing at the HTTP server
-```
-
-The stdio process never touches the browser directly. It is a smart HTTP client:
-- reads files from the local filesystem
-- composes multiple HTTP calls into single high-level MCP tools
-- handles MCP protocol details (tool schemas, content types, streaming)
-
----
-
-## Data flow for binary files
-
-```
-AI agent: "upload /Users/me/report.pdf"
-    │
-    ▼
-MCP stdio tool: upload_file({ path: "/Users/me/report.pdf" })
-    │
-    ├─ fs.readFile(path)                    ← local disk access
-    │
-    ├─ POST /v1/upload (multipart)          ← HTTP to server
-    │       │
-    │       ▼
-    │   HTTP server → session.withApp(MyApp, app => app.uploadFile(bytes))
-    │       │
-    │       ▼
-    │   MyApp.uploadFile → browserFetch('/api/upload', bytes)
-    │       │
-    │       ▼
-    │   Chrome tab executes fetch() with site cookies + session
-    │       │
-    │       ▼
-    │   returns { fileId: "abc123" }
-    │
-    └─ returns { content: [{ type: "text", text: "abc123" }] }
-    │
-    ▼
-AI agent receives fileId, uses it in subsequent calls
-```
-
-Binary data never travels through MCP's JSON-RPC layer as raw bytes — it goes through the HTTP API which handles it natively.
-
----
-
-## HttpClient and typed client
-
-```
-brapper
-└── HttpClient          generic typed fetch wrapper
-
-@my-org/my-brap
-├── http/routes.ts      Hono routes → export type AppType
-└── client/MyClient.ts  hc<AppType> wrapper with named methods
-                        ↑ types derived automatically from routes
-                        ↑ no code generation, no manual sync
-```
-
-`hc<AppType>` from Hono RPC gives full TypeScript types for all routes at zero cost. Adding a new route to `routes.ts` makes it immediately available in `MyClient` with correct request/response types.
+| Subsystem | Responsibility |
+|-----------|---------------|
+| `BrowserSupervisor` | CDP connect/reconnect with backoff, `closing` flag suppresses reconnect on shutdown |
+| `SessionGate` | Promise barrier: `wait()`, `close()`, `openGate()`, `degrade()` |
+| `SessionMonitor` | Detects failures, runs `RecoveryStrategy` chain, drives gate state |
+| `PersistentPageLane` | Per-key page leases, per-key mutex, auto-recreate |
+| `PageRegistry` | Tracks all live pages and their health for `/health` metrics |
+| `GuardRuntime` | Attaches optional `PageGuard` detectors to pages, routes trips to monitor |
 
 ---
 
@@ -143,50 +171,45 @@ brapper
 
 ```
 npm registry
-├── brapper        framework (infrastructure only)
-├── @my-org/app-one-brap         adapter for app-one.example.com
-│   ├── dist/server.js           HTTP server
-│   └── dist/mcp.js              stdio MCP binary (bin: app-one-brap-mcp)
-└── @my-org/app-two-brap         adapter for app-two.example.com
+├── brapper                    framework (infrastructure only)
+├── @my-org/app-one-brap       adapter for app-one.example.com
+│   ├── dist/server.js         HTTP server
+│   └── dist/mcp.js            stdio MCP binary (bin: app-one-brap-mcp)
+└── @my-org/app-two-brap       adapter for app-two.example.com
 
 each brap exports:
   - XxxClient    typed HTTP client (hc<AppType> wrapper)
-  - XxxApp       browser App class (for embedding in other servers)
+  - XxxApp       session-bound App class
 ```
 
 ---
 
-## What brapper owns vs what brap owns
+## What brapper owns vs what a brap owns
 
 | Concern | brapper | brap |
 |---------|---------|------|
 | CDP connection, reconnect | ✓ | |
-| Page pool + queue | ✓ | |
-| `withApp` — App class lifecycle | ✓ | |
-| PageWorker helpers | ✓ | |
-| Request modifier | ✓ | |
+| Persistent page lane (per-key lease + mutex) | ✓ | |
+| Spawned page lane (pool + queue) | ✓ | |
+| `withApp` — session-bound App lifecycle | ✓ | |
+| `PageWorker` helpers | ✓ | |
 | Cookie manager | ✓ | |
-| Navigation helpers | ✓ | |
-| Stealth options | ✓ | |
-| Hono base app, /health, CORS | ✓ | |
-| Rate limiter, request timeout | ✓ | |
-| OpenAPI generation | ✓ | |
-| MCP HTTP transport | ✓ | |
-| MCP stdio transport | ✓ | |
 | `SessionGate` — global pause barrier | ✓ | |
 | `SessionMonitor` — recovery orchestration | ✓ | |
 | `RecoveryStrategy` interface | ✓ | |
-| `HttpClient` typed fetch wrapper | ✓ | |
+| `PageGuard` interface + `GuardRuntime` | ✓ | |
+| `BrowserSupervisor` — connect/reconnect/shutdown | ✓ | |
+| `PageRegistry` — live page tracking | ✓ | |
+| Hono base app, /health, CORS | ✓ | |
 | `hc` re-export (Hono RPC) | ✓ | |
 | Env parsing base schema | ✓ | |
 | Logger | ✓ | |
-| Prometheus `/metrics` | ✓ | |
-| Graceful shutdown (drain) | ✓ | |
-| Dockerfile + docker-compose templates | ✓ | |
+| Graceful shutdown (close persistent pages, disconnect) | ✓ | |
 | Target app URL, selectors | | ✓ |
 | Auth / login flow | | ✓ |
-| Script injection (e.g. Turbopack hook) | | ✓ |
-| Captcha recovery strategy implementation | | ✓ |
+| Script injection | | ✓ |
+| Recovery strategy implementations | | ✓ |
+| Page guard implementations | | ✓ |
 | Business logic App class methods | | ✓ |
 | Route definitions | | ✓ |
 | MCP tool definitions | | ✓ |

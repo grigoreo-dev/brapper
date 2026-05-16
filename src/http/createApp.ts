@@ -52,11 +52,27 @@ export function createApp(options: CreateAppOptions): Hono {
   }
 
   app.get('/health', (c) => {
-    return c.json({
-      ok: true,
-      browser_connected: session?.isWarm ?? false,
-      timestamp: new Date().toISOString(),
-    });
+    const snapshot = session?.getHealthSnapshot();
+    const state = snapshot?.state ?? 'starting';
+    const ok = state === 'ready' && (snapshot?.browser_connected ?? false);
+
+    return c.json(
+      {
+        ok,
+        state,
+        browser_connected: snapshot?.browser_connected ?? false,
+        warm: snapshot?.warm ?? false,
+        persistent_pages: snapshot?.persistent_pages ?? {
+          total: 0,
+          healthy: 0,
+          restarting: 0,
+        },
+        spawned_inflight: snapshot?.spawned_inflight ?? 0,
+        queue_depth: snapshot?.queue_depth ?? 0,
+        timestamp: new Date().toISOString(),
+      },
+      ok ? 200 : 503,
+    );
   });
 
   app.notFound((c) => c.json({ error: 'Not found', code: 'not_found' }, 404));
